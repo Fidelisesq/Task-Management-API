@@ -1,0 +1,187 @@
+name: Destroy Infrastructure with Terraform
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'terraform/**'
+  workflow_dispatch:
+    inputs:
+      confirm_destroy:
+        description: 'Type "destroy" to confirm infrastructure destruction'
+        required: true
+        default: ''
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  TF_VERSION: 1.6.0
+
+jobs:
+  check-destroy-trigger:
+    name: Check if Destroy Should Run
+    runs-on: ubuntu-latest
+    outputs:
+      should_destroy: ${{ steps.check.outputs.should_destroy }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      
+      - name: Check commit message or manual trigger
+        id: check
+        run: |
+          # Check if manually triggered with correct confirmation
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            if [ "${{ github.event.inputs.confirm_destroy }}" == "destroy" ]; then
+              echo "should_destroy=true" >> $GITHUB_OUTPUT
+              echo "✅ Manual destroy confirmed"
+            else
+              echo "should_destroy=false" >> $GITHUB_OUTPUT
+              echo "❌ Manual destroy not confirmed (must type 'destroy')"
+            fi
+          # Check if commit message contains 'destroy'
+          elif [ "${{ github.event_name }}" == "push" ]; then
+            COMMIT_MSG=$(git log -1 --pretty=%B)
+            if echo "$COMMIT_MSG" | grep -iq "destroy"; then
+              echo "should_destroy=true" >> $GITHUB_OUTPUT
+              echo "✅ Commit message contains 'destroy': $COMMIT_MSG"
+            else
+              echo "should_destroy=false" >> $GITHUB_OUTPUT
+              echo "ℹ️  Commit message does not contain 'destroy'"
+            fi
+          else
+            echo "should_destroy=false" >> $GITHUB_OUTPUT
+          fi
+
+  terraform-destroy:
+    name: Terraform Destroy
+    runs-on: ubuntu-latest
+    needs: check-destroy-trigger
+    if: needs.check-destroy-trigger.outputs.should_destroy == 'true'
+    
+    defaults:
+      run:
+        working-directory: terraform
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Configure AWS credentials using OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/github-platform-actions-oidc
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: GitHubActions-TerraformDestroy
+      
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+      
+      - name: Terraform Init
+        id: init
+        run: terraform init
+      
+      - name: Terraform Plan Destroy
+        id: plan
+        run: |
+          terraform plan -destroy -no-color -input=false -out=destroy.tfplan \
+            -var="aws_account_id=${{ secrets.AWS_ACCOUNT_ID }}" \
+            -var="db_password=${{ secrets.DB_PASSWORD }}" \
+            -var="jwt_secret=${{ secrets.JWT_SECRET }}"
+      
+      - name: Show Destroy Plan
+        run: |
+          echo "=========================================="
+          echo "⚠️  RESOURCES TO BE DESTROYED"
+          echo "=========================================="
+          terraform show -no-color destroy.tfplan
+      
+      - name: Terraform Destroy
+        id: destroy
+        run: |
+          echo "=========================================="
+          echo "⚠️  DESTROYING INFRASTRUCTURE"
+          echo "=========================================="
+          terraform apply -auto-approve destroy.tfplan
+      
+      - name: Cleanup Summary
+        if: success()
+        run: |
+          echo "=========================================="
+          echo "✅ INFRASTRUCTURE DESTROYED"
+          echo "=========================================="
+          echo ""
+          echo "The following resources have been destroyed:"
+          echo "  - ECS clusters and services"
+          echo "  - RDS databases"
+          echo "  - Application Load Balancers"
+          echo "  - ECR repositories"
+          echo "  - S3 buckets"
+          echo "  - CloudFront distributions"
+          echo "  - Route53 records"
+          echo "  - Secrets Manager secrets"
+          echo "  - CloudWatch log groups"
+          echo "  - VPC Endpoints"
+          echo "  - Security Groups"
+          echo "  - IAM roles and policies"
+          echo ""
+          echo "⚠️  Note: Some resources may take a few minutes to fully delete"
+          echo ""
+      
+      - name: Destroy Failed
+        if: failure()
+        run: |
+          echo "=========================================="
+          echo "❌ DESTROY FAILED"
+          echo "=========================================="
+          echo ""
+          echo "The destroy operation failed. Common reasons:"
+          echo "  - Resources have dependencies that need to be removed first"
+          echo "  - RDS deletion protection is enabled"
+          echo "  - S3 buckets are not empty"
+          echo "  - CloudFront distributions are still enabled"
+          echo ""
+          echo "Check the logs above for specific errors."
+          echo ""
+          exit 1
+
+  skip-destroy:
+    name: Destroy Skipped
+    runs-on: ubuntu-latest
+    needs: check-destroy-trigger
+    if: needs.check-destroy-trigger.outputs.should_destroy == 'false'
+    
+    steps:
+      - name: Skip Message
+        run: |
+          echo "=========================================="
+          echo "ℹ️  DESTROY SKIPPED"
+          echo "=========================================="
+          echo ""
+          echo "Destroy was not triggered because:"
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            echo "  - Manual trigger confirmation was not 'destroy'"
+            echo ""
+            echo "To destroy infrastructure manually:"
+            echo "  1. Go to Actions → Destroy Infrastructure with Terraform"
+            echo "  2. Click 'Run workflow'"
+            echo "  3. Type 'destroy' in the confirmation field"
+            echo "  4. Click 'Run workflow'"
+          else
+            echo "  - Commit message does not contain 'destroy'"
+            echo ""
+            echo "To destroy infrastructure via commit:"
+            echo "  1. Make a commit with 'destroy' in the message"
+            echo "  2. Example: git commit -m 'destroy infrastructure'"
+            echo "  3. Push to main branch"
+          fi
+          echo ""

@@ -1,0 +1,94 @@
+name: Build and Deploy Services
+
+on:
+  workflow_run:
+    workflows: ["Deploy Infrastructure with Terraform"]
+    types:
+      - completed
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REGISTRY: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.us-east-1.amazonaws.com
+
+jobs:
+  build-auth-service:
+    name: Build and Push Auth Service
+    runs-on: ubuntu-latest
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/github-platform-actions-oidc
+          aws-region: ${{ env.AWS_REGION }}
+      
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+      
+      - name: Build, tag, and push auth-service image
+        working-directory: services/auth-service
+        run: |
+          IMAGE_TAG=${GITHUB_SHA::7}
+          docker build -t $ECR_REGISTRY/auth-service:$IMAGE_TAG .
+          docker tag $ECR_REGISTRY/auth-service:$IMAGE_TAG $ECR_REGISTRY/auth-service:latest
+          docker push $ECR_REGISTRY/auth-service:$IMAGE_TAG
+          docker push $ECR_REGISTRY/auth-service:latest
+          echo "IMAGE_TAG=$IMAGE_TAG" >> $GITHUB_OUTPUT
+      
+      - name: Update ECS service
+        run: |
+          aws ecs update-service \
+            --cluster task-management-cluster \
+            --service auth-service \
+            --force-new-deployment \
+            --region $AWS_REGION
+  
+  build-task-service:
+    name: Build and Push Task Service
+    runs-on: ubuntu-latest
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    needs: build-auth-service
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/github-platform-actions-oidc
+          aws-region: ${{ env.AWS_REGION }}
+      
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+      
+      - name: Build, tag, and push task-service image
+        working-directory: services/task-service
+        run: |
+          IMAGE_TAG=${GITHUB_SHA::7}
+          docker build -t $ECR_REGISTRY/task-service:$IMAGE_TAG .
+          docker tag $ECR_REGISTRY/task-service:$IMAGE_TAG $ECR_REGISTRY/task-service:latest
+          docker push $ECR_REGISTRY/task-service:$IMAGE_TAG
+          docker push $ECR_REGISTRY/task-service:latest
+          echo "IMAGE_TAG=$IMAGE_TAG" >> $GITHUB_OUTPUT
+      
+      - name: Update ECS service
+        run: |
+          aws ecs update-service \
+            --cluster task-management-cluster \
+            --service task-service \
+            --force-new-deployment \
+            --region $AWS_REGION
